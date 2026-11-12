@@ -42,6 +42,11 @@ class PipelineError(Exception):
     """Erreur bloquante : la boucle s'arrête, l'état n'est pas avancé."""
 
 
+def trace(message, level=0):
+    """Trace horodatée d'une étape (level 1 = détail d'une étape)."""
+    print(f"{time.strftime('%H:%M:%S')} {'    ' * level}{message}", flush=True)
+
+
 # ---------------------------------------------------------------- DOM minimal
 
 class Node:
@@ -130,6 +135,7 @@ def fetch(url, retries=3, timeout=30):
         except (urllib.error.URLError, OSError) as exc:
             last_error = exc
         if attempt < retries:
+            trace(f"échec ({last_error}), nouvelle tentative {attempt + 1}/{retries}...", 1)
             time.sleep(2 * attempt)
     raise PipelineError(f"téléchargement impossible de {url} : {last_error}")
 
@@ -138,15 +144,20 @@ def fetch(url, retries=3, timeout=30):
 
 def load_config(path):
     """Lit avancement.json ; le crée avec les valeurs par défaut s'il n'existe pas."""
+    trace(f"Lecture de la configuration : {path}")
     if not os.path.exists(path):
         save_config(path, DEFAULT_CONFIG)
-        print(f"Fichier {path} créé.")
+        trace("fichier absent -> créé avec les valeurs par défaut", 1)
+    else:
+        trace("fichier existant", 1)
     with open(path, encoding="utf-8") as handle:  # relu même s'il vient d'être créé
         config = json.load(handle)
     missing = [key for key in DEFAULT_CONFIG if key not in config]
     if missing:
         raise PipelineError(f"{path} : propriétés manquantes : {', '.join(missing)}")
     config["page_number"] = int(config["page_number"])
+    for key in DEFAULT_CONFIG:
+        trace(f"config_{key} = {config[key]!r}", 1)
     return config
 
 
@@ -174,6 +185,7 @@ def parse_page(html, page_url, art_name):
     dom = parse_html(html)
 
     # Image principale : le <img> dans <div id="comic">.
+    trace('Recherche de l\'image dans <div id="comic">', 1)
     comic = dom.find("div", "id", "comic")
     if comic is None:
         raise PipelineError('<div id="comic"> introuvable')
@@ -188,23 +200,31 @@ def parse_page(html, page_url, art_name):
     image_filename = os.path.basename(unquote(urlsplit(image_url).path))
     if not image_filename:
         raise PipelineError(f"nom de fichier introuvable dans {image_url}")
+    trace(f"-> source : {image_url}", 2)
+    trace(f"-> nom de fichier : {image_filename}", 2)
 
     # Page suivante : le <a> contenant "Next" dans <table id="comic-nav-wrapper">.
+    trace('Recherche du lien "Next" dans <table id="comic-nav-wrapper">', 1)
     next_url = ""
     nav = dom.find("table", "id", "comic-nav-wrapper")
-    if nav is not None:
+    if nav is None:
+        trace("-> table de navigation introuvable", 2)
+    else:
         for link in nav.find_all("a"):
             href = (link.attrs.get("href") or "").strip()
             if "Next" in link.text() and href:
                 next_url = urljoin(page_url, href)
                 break
+    trace(f"-> next_url : {next_url}" if next_url else "-> aucun lien Next (dernière page)", 2)
 
     # Chapitre : <h2> dans <div class="post-info">, de la forme "Œuvre: Chapter N".
+    trace('Recherche du <h2> dans <div class="post-info">', 1)
     post_info = dom.find("div", "class", "post-info")
     title = post_info.find("h2") if post_info is not None else None
     if title is None:
         raise PipelineError('<h2> introuvable dans <div class="post-info">')
     title_text = " ".join(title.text().split())
+    trace(f"-> titre : {title_text!r}", 2)
     parts = title_text.split(":")
     if len(parts) < 2:
         raise PipelineError(f"titre sans ':' : {title_text!r}")
@@ -215,6 +235,7 @@ def parse_page(html, page_url, art_name):
     match = re.search(r"(\d+)\s*$", parts[1])
     if match is None:
         raise PipelineError(f"numéro de chapitre introuvable dans {title_text!r}")
+    trace(f"-> œuvre conforme ({art_name!r}), chapter_number = {int(match.group(1))}", 2)
 
     return image_url, image_filename, next_url, int(match.group(1))
 
@@ -228,15 +249,21 @@ def run(root, max_pages, delay):
 
     config = load_config(config_path)
     current_url = config["last_url"] or config["start_url"]
+    origin = "config_last_url" if config["last_url"] else "config_start_url"
+    trace(f"current_url initialisée depuis {origin} : {current_url}")
     done = 0
 
     while current_url:
         if max_pages and done >= max_pages:
-            print(f"Limite de {max_pages} page(s) atteinte.")
+            trace(f"Limite de {max_pages} page(s) atteinte : arrêt.")
             break
 
+        trace(f"=== Page {config['page_number']:03d} ===")
+
         # 1. Lecture de la page
+        trace(f"1. Lecture de la page : {current_url}")
         body, charset = fetch(current_url)
+        trace(f"-> page téléchargée ({len(body)} octets)", 1)
         html = body.decode(charset or "utf-8", errors="replace")
         try:
             image_url, image_filename, next_url, chapter_number = parse_page(
@@ -246,29 +273,41 @@ def run(root, max_pages, delay):
             raise PipelineError(f"{current_url} : {exc}") from None
 
         # 2. Extraction & sauvegarde
+        trace("2. Extraction & sauvegarde")
         chapter_dir = os.path.join(images_root, f"Ch{chapter_number:02d}")
-        os.makedirs(chapter_dir, exist_ok=True)
+        if os.path.isdir(chapter_dir):
+            trace(f"répertoire existant : {chapter_dir}", 1)
+        else:
+            os.makedirs(chapter_dir)
+            trace(f"répertoire créé : {chapter_dir}", 1)
         target = os.path.join(chapter_dir, f"{config['page_number']:03d}_{image_filename}")
+        trace(f"téléchargement de l'image : {image_url}", 1)
         data, _ = fetch(image_url)
         with open(target + ".part", "wb") as handle:
             handle.write(data)
         os.replace(target + ".part", target)
-        print(f"[{config['page_number']:03d}] Ch{chapter_number:02d} <- {image_url}")
+        trace(f"-> enregistrée : {target} ({len(data)} octets)", 1)
         done += 1
 
         # 3. Mise à jour de l'état
+        trace("3. Mise à jour de l'état")
         if next_url:
             config["last_url"] = next_url
             config["page_number"] += 1
+            trace(f"config_last_url = {next_url!r}", 1)
+            trace(f"config_page_number = {config['page_number']}", 1)
+        else:
+            trace("pas de next_url : config_last_url et config_page_number inchangés", 1)
         save_config(config_path, config)
+        trace(f"configuration enregistrée : {config_path}", 1)
         current_url = next_url
 
         if current_url and delay > 0:
             time.sleep(delay)
     else:
-        print("Dernière page atteinte : pas de lien « Next ».")
+        trace("current_url vide : fin de la boucle (dernière page atteinte).")
 
-    print(f"{done} image(s) enregistrée(s) dans {images_root}")
+    trace(f"Terminé : {done} image(s) enregistrée(s) dans {images_root}")
 
 
 def main():
