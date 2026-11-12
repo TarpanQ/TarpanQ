@@ -28,6 +28,7 @@ DEFAULT_ROOT = "/home/joel/Code_Mari"
 CONFIG_NAME = "avancement.json"
 COOKIES_NAME = "cookies.txt"
 PASSWORD_NAME = "password.txt"
+DEBUG_NAME = "debug.htm"
 PASSWORD_ENV = "CODE_MARI_PASSWORD"
 LOGIN_MARKER = "password-protected=login"
 DEFAULT_CONFIG = {
@@ -180,9 +181,23 @@ class Session:
             f"{path} (une seule ligne) ou dans la variable {PASSWORD_ENV}."
         )
 
+    def fetch_html(self, url, data=None):
+        """Comme fetch, mais garde une copie de la page reçue dans debug.htm."""
+        body, charset, final_url = self.fetch(url, data=data)
+        path = os.path.join(self.root, DEBUG_NAME)
+        try:
+            with open(path, "wb") as handle:
+                handle.write(body)
+            trace(f"-> page reçue ({len(body)} octets) copiée dans {path}", 1)
+        except OSError as exc:
+            trace(f"-> copie de débogage impossible ({exc})", 1)
+        if final_url != url:
+            trace(f"-> URL finale après redirection : {final_url}", 1)
+        return body, charset, final_url
+
     def fetch_page(self, url):
         """Télécharge une page du comic, en se connectant si le site le demande."""
-        body, charset, final_url = self.fetch(url)
+        body, charset, final_url = self.fetch_html(url)
         if LOGIN_MARKER not in final_url:
             return body, charset
         trace("-> redirigé vers la page de connexion : authentification nécessaire", 1)
@@ -193,7 +208,8 @@ class Session:
             "password-protected": "login",
             "redirect_to": url,
         }).encode()
-        body, charset, final_url = self.fetch(final_url, data=form)
+        trace("envoi du formulaire de connexion", 1)
+        body, charset, final_url = self.fetch_html(final_url, data=form)
         if LOGIN_MARKER in final_url:
             raise PipelineError("connexion refusée : mot de passe incorrect ?")
         trace("-> connexion réussie", 1)
@@ -204,7 +220,7 @@ class Session:
         except OSError as exc:
             trace(f"-> cookies non enregistrés ({exc})", 1)
         if final_url.rstrip("/") != url.rstrip("/"):
-            body, charset, final_url = self.fetch(url)
+            body, charset, final_url = self.fetch_html(url)
             if LOGIN_MARKER in final_url:
                 raise PipelineError("toujours redirigé vers la connexion après authentification")
         return body, charset
@@ -334,7 +350,6 @@ def run(root, max_pages, delay):
         # 1. Lecture de la page
         trace(f"1. Lecture de la page : {current_url}")
         body, charset = session.fetch_page(current_url)
-        trace(f"-> page téléchargée ({len(body)} octets)", 1)
         html = body.decode(charset or "utf-8", errors="replace")
         try:
             image_url, image_filename, next_url, chapter_number = parse_page(
