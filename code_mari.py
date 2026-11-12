@@ -266,7 +266,7 @@ def image_source(img):
     return None
 
 
-def parse_page(html, page_url, art_name):
+def parse_page(html, page_url, art_name, previous_chapter=None):
     """Retourne (image_url, image_filename, next_url, chapter_number)."""
     dom = parse_html(html)
 
@@ -312,18 +312,30 @@ def parse_page(html, page_url, art_name):
     title_text = " ".join(title.text().split())
     trace(f"-> titre : {title_text!r}", 2)
     parts = title_text.split(":")
-    if len(parts) < 2:
-        raise PipelineError(f"titre sans ':' : {title_text!r}")
+    # Le nom de l'œuvre n'est pas cohérent d'une page à l'autre : simple information.
     if parts[0].strip() != art_name:
-        raise PipelineError(
-            f"le titre {title_text!r} ne correspond pas à l'œuvre {art_name!r}"
-        )
-    match = re.search(r"(\d+)\s*$", parts[1])
-    if match is None:
-        raise PipelineError(f"numéro de chapitre introuvable dans {title_text!r}")
-    trace(f"-> œuvre conforme ({art_name!r}), chapter_number = {int(match.group(1))}", 2)
+        trace(f"-> (info) le titre ne commence pas par {art_name!r} : contrôle désactivé", 2)
 
-    return image_url, image_filename, next_url, int(match.group(1))
+    chapter_number = None
+    if len(parts) >= 2:
+        match = re.search(r"(\d+)\s*$", parts[1])
+        if match:
+            chapter_number, origin = int(match.group(1)), "fin de la seconde partie du titre"
+    if chapter_number is None:
+        match = re.search(r"chapter\s*(\d+)", title_text, re.IGNORECASE)
+        if match:
+            chapter_number, origin = int(match.group(1)), "mention « Chapter N » du titre"
+    if chapter_number is None:
+        match = re.search(r"chapter-(\d+)", page_url, re.IGNORECASE)
+        if match:
+            chapter_number, origin = int(match.group(1)), "URL de la page"
+    if chapter_number is None and previous_chapter is not None:
+        chapter_number, origin = previous_chapter, "chapitre de la page précédente"
+    if chapter_number is None:
+        raise PipelineError(f"numéro de chapitre introuvable dans {title_text!r}")
+    trace(f"-> chapter_number = {chapter_number} ({origin})", 2)
+
+    return image_url, image_filename, next_url, chapter_number
 
 
 # ------------------------------------------------------------------- boucle
@@ -339,6 +351,7 @@ def run(root, max_pages, delay):
     origin = "config_last_url" if config["last_url"] else "config_start_url"
     trace(f"current_url initialisée depuis {origin} : {current_url}")
     done = 0
+    chapter_number = config.get("chapter_number")
 
     while current_url:
         if max_pages and done >= max_pages:
@@ -353,7 +366,7 @@ def run(root, max_pages, delay):
         html = body.decode(charset or "utf-8", errors="replace")
         try:
             image_url, image_filename, next_url, chapter_number = parse_page(
-                html, current_url, config["art_name"]
+                html, current_url, config["art_name"], chapter_number
             )
         except PipelineError as exc:
             raise PipelineError(f"{current_url} : {exc}") from None
@@ -377,6 +390,7 @@ def run(root, max_pages, delay):
 
         # 3. Mise à jour de l'état
         trace("3. Mise à jour de l'état")
+        config["chapter_number"] = chapter_number
         if next_url:
             config["last_url"] = next_url
             config["page_number"] += 1
