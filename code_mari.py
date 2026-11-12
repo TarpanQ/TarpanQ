@@ -13,6 +13,7 @@ Aucune dépendance : bibliothèque standard Python 3 uniquement.
 """
 
 import argparse
+import http.cookiejar
 import json
 import os
 import re
@@ -21,10 +22,14 @@ import time
 import urllib.error
 import urllib.request
 from html.parser import HTMLParser
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import unquote, urlencode, urljoin, urlsplit
 
 DEFAULT_ROOT = "/home/joel/Code_Mari"
 CONFIG_NAME = "avancement.json"
+COOKIES_NAME = "cookies.txt"
+PASSWORD_NAME = "password.txt"
+PASSWORD_ENV = "CODE_MARI_PASSWORD"
+LOGIN_MARKER = "password-protected=login"
 DEFAULT_CONFIG = {
     "start_url": "https://palladcity.com/comic/code-mari-chapter-1/",
     "last_url": "",
@@ -121,23 +126,88 @@ def parse_html(html):
 
 # -------------------------------------------------------------------- réseau
 
-def fetch(url, retries=3, timeout=30):
-    last_error = None
-    for attempt in range(1, retries + 1):
+class Session:
+    """Connexion HTTP avec cookies, pour un site protégé par mot de passe."""
+
+    def __init__(self, root):
+        self.root = root
+        self.jar = http.cookiejar.MozillaCookieJar(os.path.join(root, COOKIES_NAME))
         try:
-            request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.read(), response.headers.get_content_charset()
-        except urllib.error.HTTPError as exc:
-            last_error = exc
-            if exc.code < 500 and exc.code != 429:
-                break  # erreur définitive (404, 403...) : inutile de réessayer
-        except (urllib.error.URLError, OSError) as exc:
-            last_error = exc
-        if attempt < retries:
-            trace(f"échec ({last_error}), nouvelle tentative {attempt + 1}/{retries}...", 1)
-            time.sleep(2 * attempt)
-    raise PipelineError(f"téléchargement impossible de {url} : {last_error}")
+            self.jar.load(ignore_discard=True, ignore_expires=True)
+            trace(f"Cookies de session relus : {self.jar.filename}")
+        except (OSError, http.cookiejar.LoadError):
+            pass
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar)
+        )
+
+    def fetch(self, url, data=None, retries=3, timeout=30):
+        """Retourne (contenu, charset, url_finale après redirections)."""
+        last_error = None
+        for attempt in range(1, retries + 1):
+            try:
+                request = urllib.request.Request(
+                    url, data=data, headers={"User-Agent": USER_AGENT}
+                )
+                with self.opener.open(request, timeout=timeout) as response:
+                    return (response.read(), response.headers.get_content_charset(),
+                            response.geturl())
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                if exc.code < 500 and exc.code != 429:
+                    break  # erreur définitive (404, 403...) : inutile de réessayer
+            except (urllib.error.URLError, OSError) as exc:
+                last_error = exc
+            if attempt < retries:
+                trace(f"échec ({last_error}), nouvelle tentative {attempt + 1}/{retries}...", 1)
+                time.sleep(2 * attempt)
+        raise PipelineError(f"téléchargement impossible de {url} : {last_error}")
+
+    def password(self):
+        value = os.environ.get(PASSWORD_ENV, "")
+        if value:
+            trace(f"mot de passe lu dans la variable {PASSWORD_ENV}", 1)
+            return value
+        path = os.path.join(self.root, PASSWORD_NAME)
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as handle:
+                value = handle.read().strip()
+            if value:
+                trace(f"mot de passe lu dans {path}", 1)
+                return value
+        raise PipelineError(
+            "le site demande un mot de passe. Placez-le dans le fichier "
+            f"{path} (une seule ligne) ou dans la variable {PASSWORD_ENV}."
+        )
+
+    def fetch_page(self, url):
+        """Télécharge une page du comic, en se connectant si le site le demande."""
+        body, charset, final_url = self.fetch(url)
+        if LOGIN_MARKER not in final_url:
+            return body, charset
+        trace("-> redirigé vers la page de connexion : authentification nécessaire", 1)
+        form = urlencode({
+            "password_protected_pwd": self.password(),
+            "password_protected_cookie_test": "1",
+            "password_protected_rememberme": "1",
+            "password-protected": "login",
+            "redirect_to": url,
+        }).encode()
+        body, charset, final_url = self.fetch(final_url, data=form)
+        if LOGIN_MARKER in final_url:
+            raise PipelineError("connexion refusée : mot de passe incorrect ?")
+        trace("-> connexion réussie", 1)
+        try:
+            self.jar.save(ignore_discard=True, ignore_expires=True)
+            os.chmod(self.jar.filename, 0o600)
+            trace(f"-> cookies de session enregistrés : {self.jar.filename}", 1)
+        except OSError as exc:
+            trace(f"-> cookies non enregistrés ({exc})", 1)
+        if final_url.rstrip("/") != url.rstrip("/"):
+            body, charset, final_url = self.fetch(url)
+            if LOGIN_MARKER in final_url:
+                raise PipelineError("toujours redirigé vers la connexion après authentification")
+        return body, charset
 
 
 # ------------------------------------------------------------- configuration
@@ -248,6 +318,7 @@ def run(root, max_pages, delay):
     os.makedirs(images_root, exist_ok=True)
 
     config = load_config(config_path)
+    session = Session(root)
     current_url = config["last_url"] or config["start_url"]
     origin = "config_last_url" if config["last_url"] else "config_start_url"
     trace(f"current_url initialisée depuis {origin} : {current_url}")
@@ -262,7 +333,7 @@ def run(root, max_pages, delay):
 
         # 1. Lecture de la page
         trace(f"1. Lecture de la page : {current_url}")
-        body, charset = fetch(current_url)
+        body, charset = session.fetch_page(current_url)
         trace(f"-> page téléchargée ({len(body)} octets)", 1)
         html = body.decode(charset or "utf-8", errors="replace")
         try:
@@ -282,7 +353,7 @@ def run(root, max_pages, delay):
             trace(f"répertoire créé : {chapter_dir}", 1)
         target = os.path.join(chapter_dir, f"{config['page_number']:03d}_{image_filename}")
         trace(f"téléchargement de l'image : {image_url}", 1)
-        data, _ = fetch(image_url)
+        data, _, _ = session.fetch(image_url)
         with open(target + ".part", "wb") as handle:
             handle.write(data)
         os.replace(target + ".part", target)
