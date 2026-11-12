@@ -1,2 +1,4 @@
 password.txt
 cookies.txt
+__pycache__/
+debug.htm
